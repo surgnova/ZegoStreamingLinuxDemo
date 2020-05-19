@@ -79,7 +79,7 @@ void SurgnovaCamera::AllocateAndStart(Client* client)
         return;
     }
 
-    mCameraFd = open("/dev/video0", O_RDWR);
+    mCameraFd = open("/dev/video1", O_RDWR);
     if (mCameraFd == -1) {
         // couldn't find capture device
         perror("Opening Video device");
@@ -141,6 +141,15 @@ void SurgnovaCamera::AllocateAndStart(Client* client)
             fourcc,
             fmt.fmt.pix.field);
 
+    fmt.type                = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    fmt.fmt.pix.width       = 1920;
+    fmt.fmt.pix.height      = 1080;
+    fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_MJPEG;
+    fmt.fmt.pix.field = V4L2_FIELD_NONE;
+    if (-1 == xioctl(mCameraFd, VIDIOC_S_FMT, &fmt)) {
+        perror("VIDIOC_S_FMT");
+        return;
+    }
     //Save the height and width
     mWidth = fmt.fmt.pix.width;
     mHeight = fmt.fmt.pix.height;
@@ -280,7 +289,7 @@ void SurgnovaCamera::CaptureVideoDataThread()
     buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
     buf.memory = V4L2_MEMORY_MMAP;
     buf.index = 0;
-    if(-1 == xioctl(mCameraFd, VIDIOC_QUERYBUF, &buf)) {
+    if (-1 == xioctl(mCameraFd, VIDIOC_QUERYBUF, &buf)) {
         perror("Querying Buffer");
         return;
     }
@@ -289,26 +298,24 @@ void SurgnovaCamera::CaptureVideoDataThread()
     printf("Length: %d\nAddress: %p\n", buf.length, mBuffer);
     printf("Image Length: %d\n", buf.bytesused);
 
+    buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    buf.memory = V4L2_MEMORY_MMAP;
+    buf.index = 0;
+    if (-1 == xioctl(mCameraFd, VIDIOC_QBUF, &buf))
+    {
+        perror("Query Buffer");
+        return;
+    }
+
+    if (-1 == xioctl(mCameraFd, VIDIOC_STREAMON, &buf.type)) {
+        perror("Start Capture");
+        return;
+    }
 
     while (true)
     {
         ZGTimer timer;
         if (!mStartCapture) {
-            break;
-        }
-
-        struct v4l2_buffer buf = {0};
-        buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-        buf.memory = V4L2_MEMORY_MMAP;
-        buf.index = 0;
-        if(-1 == xioctl(mCameraFd, VIDIOC_QBUF, &buf))
-        {
-            perror("Query Buffer");
-            break;
-        }
-
-        if(-1 == xioctl(mCameraFd, VIDIOC_STREAMON, &buf.type)) {
-            perror("Start Capture");
             break;
         }
 
@@ -328,19 +335,40 @@ void SurgnovaCamera::CaptureVideoDataThread()
             break;
         }
 
+        /* // for v4l2 virtual camera
         cv::Mat picYV12 = cv::Mat(mHeight * 3/2, mWidth, CV_8UC1, (void*)mBuffer);
-        cv::Mat picBGR;
-        //cv::cvtColor(picYV12, picBGR, CV_YUV2BGRA_YV12);
+        cv::Mat picBGRA;
         cv::cvtColor(picYV12, picBGR, CV_YUV2RGBA_YV12);
+        */
 
         /*
-        char fileName[100];
-        static int index = 0;
-        snprintf(fileName, 100, "test_%d.bmp", index++);
-        cv::imwrite(fileName, picBGR);  //only for test
-        int length_dbg = picBGR.total() * picBGR.channels();
+        cv::Mat picYV12 = cv::Mat(mHeight, mWidth, CV_8UC2, (void*)mBuffer);
+        cv::Mat picBGRA;
+        cv::cvtColor(picYV12, picBGR, CV_YUV2BGRA_YUY2);
         */
-        //printf("length_dbg=%d\n", length_dbg);
+        cv::Mat picBGRA = cv::Mat(mWidth, mHeight, CV_8UC4);
+
+        if (mBuffer[5] == 0) {
+            printf("The buffer is zero.\n");
+        } else {
+            /*
+            int jpgfile;
+            char fileName[100];
+            static int index = 0;
+            snprintf(fileName, 100, "test_%d.jpeg", index++);
+            if((jpgfile = open(fileName, O_WRONLY | O_CREAT, 0660)) < 0){
+                perror("open");
+            }
+            write(jpgfile, mBuffer, buf.length);
+            close(jpgfile);
+            */
+
+            cv::Mat jpgData = cv::Mat(1, buf.length, CV_8UC1, (void*)mBuffer);
+            int length_jpg = jpgData.total() * jpgData.channels();
+            cv::Mat picBGR = cv::imdecode(jpgData, cv::IMREAD_COLOR);
+            int length_dbg = picBGR.total() * picBGR.channels();
+            cv::cvtColor(picBGR, picBGRA, CV_BGR2BGRA);
+        }
 
         if (mpClient != NULL) {
             int length = mWidth * mHeight * 4;
@@ -348,11 +376,22 @@ void SurgnovaCamera::CaptureVideoDataThread()
             frame_format.strides[0] = mWidth * 4;
             unsigned int reference_time_scale = 1000;
             unsigned long long reference_time = GetTimeStamp();
-            mpClient->OnIncomingCapturedData((const char *)picBGR.data, length, frame_format, reference_time, reference_time_scale);
+            mpClient->OnIncomingCapturedData((const char *)picBGRA.data, length, frame_format, reference_time, reference_time_scale);
+        }
+
+        if(-1 == xioctl(mCameraFd, VIDIOC_QBUF, &buf)) {
+            perror("Retrieving Frame");
+            break;
         }
 
         int need_sleep_ms = 1000.0f / mCaptureFPS - timer.ElapsedMs();
         std::this_thread::sleep_for(std::chrono::milliseconds(need_sleep_ms));
+    }
+
+    // Deactivate streaming
+    if(xioctl(mCameraFd, VIDIOC_STREAMOFF, &buf.type) < 0){
+        perror("VIDIOC_STREAMOFF");
+        return;
     }
 
     munmap(mBuffer, buf.length);
